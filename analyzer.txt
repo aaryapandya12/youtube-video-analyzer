@@ -1,0 +1,436 @@
+!pip install youtube-transcript-api transformers sentence-transformers vaderSentiment pandas matplotlib seaborn yt-dlp openai-whisper torch
+
+import re
+import requests
+from youtube_transcript_api import YouTubeTranscriptApi
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import matplotlib.pyplot as plt
+import seaborn as sns
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+import yt_dlp
+import whisper
+import torch
+import os
+import time
+from functools import lru_cache
+import nbformat
+
+try:
+    from IPython import get_ipython
+    if get_ipython():
+        nb = nbformat.read('Untitled38.ipynb', as_version=4)
+        if 'widgets' in nb['metadata']:
+            del nb['metadata']['widgets']
+            nbformat.write(nb, 'Untitled38.ipynb')
+except:
+    pass
+
+plt.style.use('seaborn-v0_8')
+
+@lru_cache(maxsize=1)
+def load_sentence_transformer():
+    return SentenceTransformer('all-MiniLM-L6-v2')
+
+@lru_cache(maxsize=1)
+def load_sentiment_analyzer():
+    return SentimentIntensityAnalyzer()
+
+@lru_cache(maxsize=1)
+def load_whisper_model():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return whisper.load_model("base", device=device)
+
+def get_video_id(url):
+    """Extract video ID from various YouTube URL formats with improved regex"""
+    patterns = [
+        r'(?:https?:\/\/)?(?:www\.)?(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})(?:\S+)?'
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, url, re.IGNORECASE)
+        if match and len(match.group(1)) == 11:
+            return match.group(1)
+    return None
+
+def get_transcript(url, max_retries=3):
+    """Get transcript with multiple fallback methods and retries"""
+    video_id = get_video_id(url)
+    if not video_id:
+        print("Error: Could not extract valid YouTube video ID from URL")
+        return None, None
+
+    for attempt in range(max_retries):
+        try:
+            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+            return ' '.join([entry['text'] for entry in transcript]), "api"
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"YouTube Transcript API failed after {max_retries} attempts: {str(e)}")
+            else:
+                time.sleep(1)
+
+    for attempt in range(max_retries):
+        try:
+            ydl_opts = {
+                'skip_download': True,
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitlesformat': 'vtt',
+                'subtitleslangs': ['en'],
+                'quiet': True,
+                'no_warnings': True,
+                'outtmpl': 'subtitles',
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if 'requested_subtitles' in info and info['requested_subtitles']:
+                    sub_url = info['requested_subtitles']['en']['url']
+                    response = requests.get(sub_url, timeout=10)
+                    if response.status_code == 200:
+                        lines = [line.strip() for line in response.text.split('\n')
+                                if not any(x in line for x in ['-->', 'WEBVTT', 'Kind:', 'Language:'])]
+                        return ' '.join([line for line in lines if line]), "captions"
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"yt-dlp caption extraction failed after {max_retries} attempts: {str(e)}")
+            else:
+                time.sleep(1)
+
+    for attempt in range(max_retries):
+        try:
+            print("Attempting audio transcription with Whisper...")
+
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'outtmpl': 'audio.%(ext)s',
+                'quiet': True,
+                'no_warnings': True,
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+            whisper_model = load_whisper_model()
+            result = whisper_model.transcribe("audio.mp3")
+
+            if os.path.exists("audio.mp3"):
+                os.remove("audio.mp3")
+
+            return result["text"], "whisper"
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"Whisper transcription failed after {max_retries} attempts: {str(e)}")
+            else:
+                time.sleep(5)
+
+    return None, None
+
+def preprocess_text(text):
+    """Clean and normalize text for analysis"""
+    if not text:
+        return ""
+    text = re.sub(r'[^\w\s]', ' ', text.lower())
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def calculate_keyword_density(transcript, keywords):
+    """Calculate keyword density with improved matching"""
+    if not transcript or not keywords:
+        return 0
+
+    clean_text = preprocess_text(transcript)
+    words = clean_text.split()
+    total_words = len(words)
+    if total_words == 0:
+        return 0
+
+    clean_keywords = [preprocess_text(kw) for kw in keywords if kw.strip()]
+
+    keyword_count = 0
+    for word in words:
+        for keyword in clean_keywords:
+            if keyword and (keyword == word or f"{keyword}" in word):
+                keyword_count += 1
+                break
+
+    return keyword_count / total_words if total_words > 0 else 0
+
+def calculate_semantic_similarity(transcript, topic):
+    """Calculate semantic similarity with caching and batching"""
+    if not transcript or not topic:
+        return 0
+
+    model = load_sentence_transformer()
+    max_length = 512
+    transcript_chunks = [transcript[i:i+max_length] for i in range(0, len(transcript), max_length)]
+    topic_chunks = [topic[i:i+max_length] for i in range(0, len(topic), max_length)]
+
+    transcript_embeddings = model.encode(transcript_chunks)
+    topic_embeddings = model.encode(topic_chunks)
+
+    avg_transcript_embedding = transcript_embeddings.mean(axis=0)
+    avg_topic_embedding = topic_embeddings.mean(axis=0)
+
+    similarity = cosine_similarity(
+        [avg_transcript_embedding],
+        [avg_topic_embedding]
+    )[0][0]
+
+    return max(0, min(1, (similarity + 1) / 2))
+
+def analyze_sentiment(transcript):
+    if not transcript:
+        return 0.5
+
+    analyzer = load_sentiment_analyzer()
+
+    chunk_size = 1000
+    chunks = [transcript[i:i+chunk_size] for i in range(0, len(transcript), chunk_size)]
+    compound_scores = []
+
+    for chunk in chunks:
+        scores = analyzer.polarity_scores(chunk)
+        compound_scores.append(scores['compound'])
+
+    avg_score = sum(compound_scores) / len(compound_scores) if compound_scores else 0
+    return max(0, min(1, (avg_score + 1) / 2))
+
+def calculate_usefulness_score(url, keywords, topic, weights=None):
+    """Calculate overall usefulness score with improved validation"""
+    if weights is None:
+        weights = {
+            'keyword_density': 0.4,
+            'semantic_similarity': 0.4,
+            'sentiment': 0.2
+        }
+
+    if not url or not isinstance(keywords, (list, tuple)) or not topic:
+        print("Error: Invalid input parameters")
+        return None, None
+
+    transcript, method = get_transcript(url)
+    if not transcript:
+        print("Warning: No transcript available for this video")
+        return None, None
+
+    metrics = {
+        'keyword_density': calculate_keyword_density(transcript, keywords),
+        'semantic_similarity': calculate_semantic_similarity(transcript, topic),
+        'sentiment': analyze_sentiment(transcript),
+        'transcript_method': method
+    }
+
+    try:
+        score = sum(metrics[component] * weights[component] for component in weights)
+        score = max(0, min(1, score))  # Clamp between 0 and 1
+    except Exception as e:
+        print(f"Error calculating score: {str(e)}")
+        return None, None
+
+    return score, metrics
+
+def visualize_results(score, metrics, video_title=None):
+    """Create enhanced visualization of the results"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    if video_title:
+        fig.suptitle(f"Analysis Results: {video_title[:60] + '...' if len(video_title) > 60 else video_title}",
+                    fontsize=14, y=1.05)
+
+    score_color = plt.cm.RdYlGn(score)
+    ax1.bar(['Usefulness Score'], [score], color=score_color)
+    ax1.set_ylim(0, 1)
+    ax1.set_title('Overall Usefulness Score', pad=20)
+    ax1.text(0, score/2, f"{score:.2f}", ha='center', va='center',
+            color='white' if score < 0.5 else 'black', fontsize=24, fontweight='bold')
+
+    components = ['Keyword Density', 'Semantic Similarity', 'Sentiment']
+    values = [metrics['keyword_density'], metrics['semantic_similarity'], metrics['sentiment']]
+    colors = ['#4c72b0', '#55a868', '#c44e52']
+
+    bars = ax2.bar(components, values, color=colors)
+    ax2.set_ylim(0, 1)
+    ax2.set_title('Score Components', pad=20)
+    ax2.grid(axis='y', alpha=0.3)
+
+    for bar in bars:
+        height = bar.get_height()
+        ax2.text(bar.get_x() + bar.get_width()/2., height - 0.05,
+                f'{height:.2f}',
+                ha='center', va='bottom', color='white', fontweight='bold')
+
+    method_map = {
+        'api': 'YouTube API',
+        'captions': 'Video Captions',
+        'whisper': 'Audio Transcription'
+    }
+    method = method_map.get(metrics.get('transcript_method', ''), 'Unknown')
+    fig.text(0.5, -0.05, f"Transcript Source: {method}", ha='center', fontsize=10, style='italic')
+
+    plt.tight_layout()
+    plt.show()
+
+def get_video_title(url):
+    """Get video title with improved error handling"""
+    try:
+        video_id = get_video_id(url)
+        if not video_id:
+            return None
+
+        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        response = requests.get(oembed_url, timeout=5)
+        if response.status_code == 200:
+            return response.json().get('title')
+
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get('title')
+
+    except Exception as e:
+        print(f"Error getting video title: {str(e)}")
+        return None
+
+url_input = widgets.Text(
+    placeholder='Enter YouTube URL (e.g., https://youtu.be/abc123)',
+    description='URL:',
+    layout=widgets.Layout(width='90%'),
+    style={'description_width': 'initial'}
+)
+
+keywords_input = widgets.Text(
+    placeholder='Enter keywords (comma separated, e.g., AI, machine learning)',
+    description='Keywords:',
+    layout=widgets.Layout(width='90%'),
+    style={'description_width': 'initial'}
+)
+
+topic_input = widgets.Text(
+    placeholder='Enter topic description (e.g., Introduction to neural networks)',
+    description='Topic:',
+    layout=widgets.Layout(width='90%'),
+    style={'description_width': 'initial'}
+)
+
+weight_keyword = widgets.FloatSlider(
+    value=0.4,
+    min=0,
+    max=1,
+    step=0.05,
+    description='Keyword Weight:',
+    continuous_update=False,
+    layout=widgets.Layout(width='90%'),
+    style={'description_width': 'initial'}
+)
+
+weight_semantic = widgets.FloatSlider(
+    value=0.4,
+    min=0,
+    max=1,
+    step=0.05,
+    description='Semantic Weight:',
+    continuous_update=False,
+    layout=widgets.Layout(width='90%'),
+    style={'description_width': 'initial'}
+)
+
+weight_sentiment = widgets.FloatSlider(
+    value=0.2,
+    min=0,
+    max=1,
+    step=0.05,
+    description='Sentiment Weight:',
+    continuous_update=False,
+    layout=widgets.Layout(width='90%'),
+    style={'description_width': 'initial'}
+)
+
+analyze_button = widgets.Button(
+    description="Analyze Video",
+    button_style='success',
+    layout=widgets.Layout(width='200px', height='40px')
+)
+
+output = widgets.Output()
+
+def on_analyze_button_clicked(b):
+    with output:
+        clear_output()
+        url = url_input.value.strip()
+        keywords = [k.strip() for k in keywords_input.value.split(',') if k.strip()]
+        topic = topic_input.value.strip()
+
+        if not url or not keywords or not topic:
+            print("Error: Please fill in all required fields")
+            return
+
+        print("Analyzing video...")
+        start_time = time.time()
+
+        video_title = get_video_title(url)
+        if video_title:
+            print(f"Video: {video_title}")
+
+        weights = {
+            'keyword_density': weight_keyword.value,
+            'semantic_similarity': weight_semantic.value,
+            'sentiment': weight_sentiment.value
+        }
+
+        score, metrics = calculate_usefulness_score(url, keywords, topic, weights)
+
+        if score is not None:
+            elapsed_time = time.time() - start_time
+            print(f"\nAnalysis completed in {elapsed_time:.1f} seconds")
+            print("\nAnalysis Results:")
+            print(f"Overall Usefulness Score: {score:.2f}/1.0")
+            print("\nDetailed Metrics:")
+            print(f"- Keyword Density: {metrics['keyword_density']:.2f}")
+            print(f"- Semantic Similarity: {metrics['semantic_similarity']:.2f}")
+            print(f"- Sentiment Score: {metrics['sentiment']:.2f}")
+
+            visualize_results(score, metrics, video_title)
+        else:
+            print("Failed to analyze video. Please check the URL and try again.")
+
+analyze_button.on_click(on_analyze_button_clicked)
+
+display(widgets.VBox([
+    widgets.HTML("<h1 style='text-align: center;'>YouTube Video Usefulness Analyzer</h1>"),
+    widgets.HTML("<p style='text-align: center;'>Analyze how relevant a YouTube video is to your topic of interest</p>"),
+    url_input,
+    keywords_input,
+    topic_input,
+    widgets.HTML("<h3 style='margin-top: 20px;'>Score Weights</h3>"),
+    weight_keyword,
+    weight_semantic,
+    weight_sentiment,
+    widgets.HBox([analyze_button], layout=widgets.Layout(justify_content='center')),
+    output
+]))
+
+test_url = "https://www.youtube.com/watch?v=aircAruvnKk"
+test_keywords = ["neural network", "machine learning", "deep learning"]
+test_topic = "Introduction to neural networks"
+
+print("\nRunning test with known working video...")
+test_score, test_metrics = calculate_usefulness_score(test_url, test_keywords, test_topic)
+if test_score is not None:
+    print(f"Test successful! Usefulness score: {test_score:.2f}")
+    visualize_results(test_score, test_metrics, get_video_title(test_url))
+else:
+    print("Test failed - please check the error messages above")
